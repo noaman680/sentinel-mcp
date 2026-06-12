@@ -1,187 +1,279 @@
 # databricks-langgraph-mcp
 
-> **Production-grade LangGraph agent** with Databricks foundation model inference and multi-server MCP tool integration.
+> **Production-grade LangGraph agent** — Databricks foundation model inference × multi-server MCP tool integration × durable state persistence × automated ML evaluation.
 
 [![CI](https://github.com/your-org/databricks-langgraph-mcp/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/your-org/databricks-langgraph-mcp/actions/workflows/ci-cd.yml)
 [![Eval Pipeline](https://github.com/your-org/databricks-langgraph-mcp/actions/workflows/eval-pipeline.yml/badge.svg)](https://github.com/your-org/databricks-langgraph-mcp/actions/workflows/eval-pipeline.yml)
 [![Coverage](https://codecov.io/gh/your-org/databricks-langgraph-mcp/branch/main/graph/badge.svg)](https://codecov.io/gh/your-org/databricks-langgraph-mcp)
-[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue)](pyproject.toml)
+[![Python](https://img.shields.io/badge/python-3.10%20|%203.11%20|%203.12-blue)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
 
 ---
 
-## Architecture
+## System Architecture
 
+```mermaid
+graph TD
+    User(["👤 User Request"])
+    GI["🛡️ guardrail_input\nRule-based + LlamaGuard\nTier-1: regex ~0ms\nTier-2: model ~300ms"]
+    TD["🔍 tool_discovery\nMulti-server MCP\nSchema validation\nCircuit-breaker"]
+    AG["🧠 agent_node\nChatDatabricks\nReAct reasoning\nTool binding"]
+    TE["⚙️ tool_executor\nAsync fan-out\nPer-call audit log\nError detection"]
+    ER["🔧 error_remediation\nSelf-healing prompt\nMax 3 attempts\nDiagnostic context"]
+    RP["📝 respond_node\nFinal answer\nStatus resolution"]
+    GO["🛡️ guardrail_output\nOutput safety\nPII redaction\nSIEM logging"]
+    CP[("💾 Checkpointer\nSQLite / Redis\nThread-scoped\nTime-travel debug")]
+    MF["📊 MLflow\nGenAI scorers\nPrecision/Recall\nLatency P95"]
+
+    User --> GI
+    GI -->|"ALLOW"| TD
+    GI -->|"BLOCK ⛔"| RP
+    TD --> AG
+    AG -->|"tool_calls"| TE
+    AG -->|"no tool_calls"| RP
+    TE -->|"SUCCESS"| AG
+    TE -->|"ERROR"| ER
+    TE -->|"budget exhausted"| RP
+    ER -->|"retry"| AG
+    ER -->|"terminal"| RP
+    RP --> GO
+    GO --> User
+
+    AG -.->|"checkpoint every node"| CP
+    TE -.->|"checkpoint every node"| CP
+    RP -.->|"eval metrics"| MF
+
+    style GI fill:#ff9999,color:#000
+    style GO fill:#ff9999,color:#000
+    style ER fill:#ffcc99,color:#000
+    style CP fill:#99ccff,color:#000
+    style MF fill:#99ff99,color:#000
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        StateGraph (LangGraph)                    │
-│                                                                   │
-│  START → tool_discovery → agent ──┬──→ tool_executor → agent    │
-│                                   └──→ respond → END            │
-│                                                                   │
-│  Routing:  edges.should_continue()    after_tool_execution()     │
-│  State:    AgentState (TypedDict)     GraphConfig (RunnableConfig│
-└─────────────────────────────────────────────────────────────────┘
-           │                    │
-           ▼                    ▼
-   ChatDatabricks          MCPClientManager
-   (LLM inference)     (SSE connections, circuit-breaker,
-                         schema validation, audit log)
-           │                    │
-           ▼                    ▼
-   Databricks FMAPI      MCP Server 1 … N
+
+### Security & Data Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant GI as Input Guardrail
+    participant AG as Agent
+    participant SM as Secret Manager
+    participant DB as Databricks M2M OAuth
+    participant MCP as MCP Server
+
+    C->>GI: user_message
+    GI->>GI: Rule-based check (~0ms)
+    GI->>GI: LlamaGuard check (~300ms)
+    GI-->>C: BLOCK (if unsafe)
+    GI->>AG: ALLOW (safe message)
+    AG->>SM: get_secret("databricks-sp-client-id")
+    SM->>SM: Databricks Secret Scope / AKV / AWS KMS
+    SM-->>AG: client_id (decrypted in-flight)
+    AG->>DB: POST /oidc/v1/token (client_credentials)
+    DB-->>AG: access_token (3600s TTL, auto-refreshed)
+    AG->>MCP: tool call + Bearer token
+    MCP-->>AG: tool result
+    AG-->>C: final_answer (via output guardrail)
 ```
-
-### Key design decisions
-
-| Concern | Approach | Why |
-|---------|----------|-----|
-| **Type safety** | Pydantic v2 `BaseSettings` + `TypedDict` state | Fail-fast at startup, not at request time |
-| **State reducers** | `Annotated[list, add_messages]` / `lambda a, b: a + b` | Correct concurrent branch merging |
-| **Error isolation** | Per-server circuit-breaker in `MCPClientManager` | One bad MCP server ≠ agent failure |
-| **Secret handling** | `SecretStr` fields; no secrets in YAML/code | Prevents accidental logging of credentials |
-| **Evaluation** | MLflow GenAI metrics + JUnit XML in CI | Quantified, comparable quality gates |
-| **Container security** | Non-root UID, no shell in runtime stage, Trivy scan | FAANG-grade supply-chain posture |
 
 ---
 
-## Repository layout
+## Core Capabilities
+
+| Capability | Implementation | Production Signal |
+|---|---|---|
+| **Durable state persistence** | `AsyncSqliteSaver` (dev) / `AsyncRedisSaver` (prod) | Conversations survive pod evictions; horizontal scaling |
+| **Self-healing tool execution** | `error_remediation_node` with diagnostic prompt injection | Structured retry loop vs. silent failure |
+| **Input/output guardrails** | Rule-based (regex, ~0ms) + LlamaGuard (model, ~300ms) | Two-tier architecture balances latency vs. accuracy |
+| **Zero-PAT authentication** | OAuth 2.0 M2M via `DatabricksM2MCredentialProvider` | Tokens scoped, auditable, auto-rotated |
+| **Multi-cloud secret management** | Databricks Secret Scopes / Azure Key Vault / AWS KMS | Unified API; backend swapped without code changes |
+| **Schema-validated tool calls** | `jsonschema.validate()` before every network round-trip | Rejects malformed arguments; blocks injection |
+| **Per-server circuit-breaker** | `ServerHealth` tracks consecutive failures; opens at 5 | One bad MCP server cannot block all tools |
+| **Append-only audit log** | `ToolCallRecord` + `RemediationAttempt` in state | Tamper-evident; enables forensic replay |
+| **Multi-server tool discovery** | `MCPClientManager` deduplicates and namespaces tools | Collision-safe; stable hash for drift detection |
+| **Streaming state updates** | `graph.astream()` with `stream_mode="updates"` | SSE / WebSocket compatible |
+| **Thread-based conversations** | `thread_config(thread_id)` + checkpointer | Resume exact state by thread_id across restarts |
+
+---
+
+## Repository Layout
 
 ```
 databricks-langgraph-mcp/
 ├── .github/workflows/
-│   ├── ci-cd.yml           # Lint → test → build → vulnerability scan
-│   └── eval-pipeline.yml   # LLM quality gate on every PR touching src/
+│   ├── ci-cd.yml              # Lint → type-check → test → container build → Trivy scan
+│   └── eval-pipeline.yml      # LLM quality gate (precision/recall/safety/latency)
+│
 ├── src/mcp_agent/
-│   ├── config.py           # Pydantic settings; validated at import time
-│   ├── state.py            # TypedDict AgentState + ToolCallRecord
-│   ├── nodes.py            # Pure async node functions (no topology knowledge)
-│   ├── edges.py            # Pure routing functions (no side effects)
-│   ├── agent.py            # Graph compilation + public run_agent() / stream_agent()
-│   └── tools/
-│       └── mcp_client.py   # Multi-server discovery, circuit-breaker, schema validation
+│   ├── agent.py               # Graph compilation + agent_lifespan context manager
+│   ├── config.py              # Pydantic v2 BaseSettings; strict types; fail-fast
+│   ├── state.py               # TypedDict AgentState; append-only reducers
+│   ├── nodes.py               # 7 pure async node functions
+│   ├── edges.py               # Pure routing functions; exhaustive decision tables
+│   │
+│   ├── tools/
+│   │   └── mcp_client.py      # Multi-server discovery; circuit-breaker; schema validation
+│   │
+│   ├── persistence/
+│   │   └── checkpointer.py    # SQLite/Redis/Memory factory; thread utilities
+│   │
+│   ├── guardrails/
+│   │   └── classifier.py      # Two-tier input/output classifier; PII redaction
+│   │
+│   └── security/
+│       ├── auth.py            # OAuth M2M credential provider; token refresh guard
+│       └── secrets.py         # Databricks / Azure KV / AWS SM — unified interface
+│
 ├── tests/
-│   ├── unit/               # Zero-network, < 5s total
-│   ├── integration/        # Full graph trajectories, mocked boundaries
-│   └── evaluation/         # MLflow GenAI metrics against golden dataset
-├── config/agent_config.yaml
-├── Dockerfile              # Multi-stage, non-root, OCI-labelled
-└── pyproject.toml          # uv / hatchling; ruff + mypy + pytest configured
+│   ├── unit/                  # Zero-network; < 5s; 100% edge coverage
+│   ├── integration/           # Full graph trajectories; 6 failure scenarios
+│   └── evaluation/
+│       ├── test_bench.json    # 10-case golden dataset (low/med/high complexity)
+│       └── run_eval.py        # MLflow GenAI runner; threshold-gated CI exit
+│
+├── config/agent_config.yaml   # Non-secret defaults; committed safely
+├── Dockerfile                 # Multi-stage; non-root uid 1000; Trivy-clean
+└── pyproject.toml             # uv/hatchling; ruff + mypy strict + pytest
 ```
 
 ---
 
-## Quick start
+## Enterprise Evaluation Strategy
 
-### Prerequisites
+### Metric taxonomy
 
-- Python 3.10+
-- [uv](https://docs.astral.sh/uv/) (`pip install uv`)
-- A Databricks workspace with a served foundation model endpoint
-- (Optional) One or more MCP servers
+```mermaid
+graph LR
+    subgraph "Tool Quality"
+        P["Tool Precision\n|called ∩ expected|\n÷ |called|\nTarget ≥ 0.80"]
+        R["Tool Recall\n|called ∩ expected|\n÷ |expected|\nTarget ≥ 0.80"]
+    end
 
-### 1. Clone and install
+    subgraph "Answer Quality"
+        K["Keyword Coverage\nhits ÷ expected\nTarget ≥ 0.70"]
+        REL["MLflow Relevance\nRelevanceToQuery scorer\nTarget ≥ 0.80"]
+        GRD["MLflow Groundedness\nRetrievalGroundedness\nTarget ≥ 0.75"]
+    end
+
+    subgraph "Safety"
+        SAF["Safety Pass Rate\nLlamaGuard + rules\nTarget ≥ 0.95"]
+    end
+
+    subgraph "Performance"
+        LAT["Latency P95\nEnd-to-end wall clock\nTarget ≤ 12 000ms"]
+    end
+```
+
+### How metrics gate PRs
+
+Every pull request that modifies `src/` or `config/` triggers `eval-pipeline.yml`:
+
+1. The runner executes all 10 golden cases from `test_bench.json` in parallel (concurrency=3).
+2. Per-case results are logged as JSON artifacts to MLflow.
+3. MLflow GenAI scorers (`RelevanceToQuery`, `Safety`, `Correctness`) add model-graded metrics.
+4. Aggregate metrics are compared against thresholds. **One violation = pipeline failure**.
+5. Results are posted as a PR comment with a pass/fail table.
+
+Thresholds are tunable via environment variables (`MCP_EVAL_MIN_PRECISION` etc.) so they can be progressively tightened as the system matures without changing code.
+
+---
+
+## Local Setup
 
 ```bash
+# 1. Clone and install
 git clone https://github.com/your-org/databricks-langgraph-mcp.git
 cd databricks-langgraph-mcp
-uv sync --extra dev
-```
+uv venv && source .venv/bin/activate
+uv pip install -e ".[dev]"
 
-### 2. Configure
-
-```bash
+# 2. Configure credentials (never committed)
 cp .env.example .env
-# Edit .env — minimum required:
+# Edit .env — required variables:
 # MCP_AGENT__DATABRICKS_HOST=https://adb-<id>.azuredatabricks.net
-# MCP_AGENT__DATABRICKS_TOKEN=dapi...
-# MCP_AGENT__MCP_SERVER_URLS=https://your-mcp-server.example.com/sse
-```
+# MCP_AGENT__DATABRICKS_TOKEN=dapi...          ← dev only; use M2M in prod
+# MCP_AGENT__MCP_SERVER_URLS=https://mcp.example.com/sse
 
-### 3. Run
+# 3. Run lint, type-check, tests
+uv run ruff check src/ tests/
+uv run mypy src/mcp_agent --strict
+uv run pytest tests/unit/ tests/integration/ -v --cov=src/mcp_agent --cov-fail-under=85
 
-```python
+# 4. Run the agent interactively
+python - <<'EOF'
 import asyncio
 from mcp_agent import run_agent
-
-result = asyncio.run(run_agent("List all tables in the analytics catalog."))
+result = asyncio.run(run_agent("What warehouses are available?"))
 print(result["final_answer"])
+EOF
 ```
 
-### 4. Stream
-
-```python
-import asyncio
-from mcp_agent import stream_agent
-
-async def main():
-    async for update in stream_agent("What is the P95 query latency?"):
-        print(update)
-
-asyncio.run(main())
-```
-
----
-
-## Development
+## Production Deployment
 
 ```bash
-# Lint + format
-uv run ruff check src/ tests/
-uv run ruff format src/ tests/
+# Build and scan image
+docker build -t mcp-agent:latest .
+trivy image mcp-agent:latest --severity HIGH,CRITICAL --exit-code 1
 
-# Type-check
-uv run mypy src/mcp_agent --strict
+# Run with M2M credentials (no PAT)
+docker run --rm \
+  -e MCP_AGENT__DATABRICKS_HOST="https://adb-xxx.azuredatabricks.net" \
+  -e MCP_AGENT__MODEL_PROVIDER="databricks" \
+  -e MCP_AGENT__SECRET_BACKEND="databricks" \
+  -e DATABRICKS_SECRET_SCOPE="mcp-agent-prod" \
+  mcp-agent:latest
 
-# Unit tests (fast, no credentials needed)
-uv run pytest tests/unit/ -v --cov=src/mcp_agent --cov-fail-under=85
+# Resume an existing conversation (persistence via Redis)
+python - <<'EOF'
+import asyncio
+from mcp_agent.agent import run_agent
+from mcp_agent.persistence import PersistenceBackend
 
-# Integration tests (mocked boundaries)
-uv run pytest tests/integration/ -v
+# First turn
+r1 = asyncio.run(run_agent("List my warehouses", thread_id="user-42", backend=PersistenceBackend.REDIS))
 
-# Evaluation suite (requires live Databricks + MLflow)
-MLFLOW_TRACKING_URI=http://localhost:5000 uv run pytest tests/evaluation/ -v
+# Second turn — full history is loaded from Redis
+r2 = asyncio.run(run_agent("Which one has the highest latency?", thread_id="user-42", backend=PersistenceBackend.REDIS))
+print(r2["final_answer"])
+EOF
 ```
 
----
+## Security Posture
 
-## CI / CD
-
-| Workflow | Trigger | Gates |
-|----------|---------|-------|
-| `ci-cd.yml` | Push / PR to main | ruff lint, mypy strict, pytest ≥85% coverage, Trivy HIGH/CRIT |
-| `eval-pipeline.yml` | PR touching `src/` or `config/` | Tool precision ≥0.80, recall ≥0.80, keyword coverage ≥0.70, P95 latency ≤10s |
-
-Container images are published to `ghcr.io/your-org/databricks-langgraph-mcp` on every push to `main`.
-
----
-
-## Configuration reference
-
-All settings are sourced from environment variables with prefix `MCP_AGENT__`.
-
-| Variable | Type | Default | Description |
-|----------|------|---------|-------------|
-| `MCP_AGENT__MODEL_PROVIDER` | enum | `databricks` | Inference provider |
-| `MCP_AGENT__MODEL_NAME` | str | `databricks-meta-llama-3-1-70b-instruct` | Model endpoint name |
-| `MCP_AGENT__DATABRICKS_HOST` | URL | — | Workspace URL (**required**) |
-| `MCP_AGENT__DATABRICKS_TOKEN` | secret | — | PAT or M2M token (**required**) |
-| `MCP_AGENT__MCP_SERVER_URLS` | list | `[]` | Comma-separated SSE server URLs |
-| `MCP_AGENT__MAX_ITERATIONS` | int | `20` | ReAct loop ceiling |
-| `MCP_AGENT__LOG_LEVEL` | enum | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
-| `MCP_AGENT__MLFLOW_TRACKING_URI` | str | — | MLflow server URI |
-| `MCP_AGENT__ENABLE_LANGSMITH_TRACING` | bool | `false` | Enable LangSmith traces |
-
----
-
-## Security
-
-- **Secrets**: never committed; loaded exclusively from environment variables via `pydantic-settings`.
-- **Container**: non-root user (uid 1000), no shell binary in runtime stage, Trivy-scanned on every build.
-- **MCP validation**: tool call arguments are JSON-Schema validated before any network round-trip.
-- **Audit log**: every tool call produces a tamper-evident `ToolCallRecord` appended to `AgentState.tool_call_log`.
+| Layer | Control | Implementation |
+|---|---|---|
+| **Auth** | OAuth 2.0 M2M; zero PATs | `DatabricksM2MCredentialProvider`; token TTL 3600s; 60s refresh buffer |
+| **Secrets** | Cloud key store only | `DatabricksSecretManager` / `AzureKeyVaultSecretManager` / `AWSSecretsManager` |
+| **Input** | Prompt injection + PII | Rule-based (regex, ~0ms) → LlamaGuard (~300ms); PII auto-redacted |
+| **Output** | Toxic generation | Same two-tier classifier on agent output; blocked outputs sent to SIEM |
+| **Tool args** | JSON Schema pre-validation | `jsonschema.validate()` before every network call |
+| **Container** | Non-root, no shell | UID 1000; no bash/sh in runtime stage; Trivy HIGH/CRIT gate in CI |
+| **Audit** | Append-only log | `ToolCallRecord` + `RemediationAttempt` in state; never mutated in place |
+| **Secrets in logs** | Pydantic `SecretStr` | `get_secret_value()` required; never appears in `repr()` or tracebacks |
 
 To report a vulnerability, email `security@your-org.example.com` — do not open a public issue.
+
+---
+
+## Configuration Reference
+
+All settings use prefix `MCP_AGENT__` and are validated at startup via Pydantic v2.
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `MODEL_PROVIDER` | enum | `databricks` | `databricks` \| `openai` \| `anthropic` |
+| `MODEL_NAME` | str | `databricks-meta-llama-3-1-70b-instruct` | Serving endpoint name |
+| `DATABRICKS_HOST` | URL | — | Workspace URL **(required)** |
+| `DATABRICKS_TOKEN` | secret | — | Dev PAT; use M2M in prod |
+| `MCP_SERVER_URLS` | list | `[]` | Comma-separated SSE endpoints |
+| `PERSISTENCE_BACKEND` | enum | `sqlite` | `sqlite` \| `redis` \| `memory` |
+| `SQLITE_DB_PATH` | str | `agent_checkpoints.db` | SQLite file path |
+| `REDIS_URL` | str | `redis://localhost:6379/0` | Redis connection URL |
+| `SECRET_BACKEND` | enum | `databricks` | `databricks` \| `azure` \| `aws` |
+| `ENABLE_GUARDRAILS` | bool | `true` | Toggle LlamaGuard model tier |
+| `MAX_ITERATIONS` | int | `20` | ReAct loop ceiling |
+| `MLFLOW_TRACKING_URI` | str | — | MLflow server URI |
+| `LOG_LEVEL` | enum | `INFO` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` |
 
 ---
 
